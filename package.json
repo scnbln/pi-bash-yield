@@ -11,6 +11,14 @@
     "background-jobs"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scnbln/pi-bash-yield.git"
+  },
+  "homepage": "https://github.com/scnbln/pi-bash-yield#readme",
+  "bugs": {
+    "url": "https://github.com/scnbln/pi-bash-yield/issues"
+  },
   "files": [
     "src/",
     "!src/**/*.test.ts",
