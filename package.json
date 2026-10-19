@@ -1,6 +1,6 @@
 {
   "name": "pi-bash-yield",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension: a running foreground bash command steps aside when you send a message, keeps running as a background job, and reports back when it finishes.",
   "type": "module",
   "keywords": [
