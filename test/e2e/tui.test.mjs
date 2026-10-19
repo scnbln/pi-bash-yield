@@ -52,10 +52,13 @@ test("tui: Enter while bash runs yields, the model sees the message, completion 
 		await waitFor(/\$ sleep 3\.31/);
 		await sleep(500);
 		keys("STEER-FROM-TUI", "Enter");
-		await waitFor(/Backgrounded early .* as job bash-1/, 2000);
+		await waitFor(/↪ moved to background \(message received\) as bash-1/, 2000);
+		await waitFor(/⏵ bash-1 running/, 2000);
 		await waitFor(/"text":"STEER-FROM-TUI"/, 2000);
 		assert.equal(alive("3.31"), true, "command keeps running");
-		await waitFor(/bash-1 succeeded exit=0[\s\S]*done-marker[\s\S]*TURN3/, 8000);
+		// Collapsed notice: one summary line; the model still got the full text (TURN3 echoes it).
+		await waitFor(/✓ bash-1 succeeded exit=0 \d+s — sleep 3\.31[\s\S]*TURN3[\s\S]*Background bash job finished/, 8000);
+		await waitFor(/^(?![\s\S]*⏵ bash-1 running)/, 2000);
 	});
 });
 
@@ -73,7 +76,7 @@ test("tui: Esc kills the foreground command", { skip: !hasTmux }, async () => {
 
 test("tui: threshold backgrounds; /reload kills the job", { skip: !hasTmux }, async () => {
 	await withTui("reload", "sleep 62.2; echo y", "--bash-yield-threshold 1", async ({ waitFor, keys }) => {
-		await waitFor(/Still running after 1s; moved to the background/, 5000);
+		await waitFor(/↪ moved to background \(still running after 1s\) as bash-1/, 5000);
 		assert.equal(alive("62.2"), true);
 		keys("/reload", "Enter");
 		await waitFor(/Reloaded/);

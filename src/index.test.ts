@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { test } from "node:test";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
-import bashYield, { capabilitiesFor, parseThresholdSeconds } from "./index.ts";
+import { Text } from "@earendil-works/pi-tui";
+import bashYield, { capabilitiesFor, effectiveThresholdMs, parseThresholdSeconds } from "./index.ts";
+import { backgroundAwareRenderResult, noticeRenderer } from "./render.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -11,7 +13,10 @@ function harness(options: { mode?: string; flags?: Record<string, unknown> } = {
 	const tools = new Map<string, any>();
 	const handlers = new Map<string, Handler[]>();
 	const sent: { message: any; options: any }[] = [];
+	const statuses: (string | undefined)[] = [];
+	const renderers = new Map<string, any>();
 	const pi: any = {
+		registerMessageRenderer: (type: string, r: any) => renderers.set(type, r),
 		registerFlag() {},
 		getFlag: (name: string) => options.flags?.[name],
 		getSettings: () => ({}),
@@ -27,6 +32,7 @@ function harness(options: { mode?: string; flags?: Record<string, unknown> } = {
 		hasPendingMessages: () => pending,
 		sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
 		model: undefined,
+		ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
 	};
 	const bash = (params: any, signal?: AbortSignal, id = "call-1") => tools.get("bash").execute(id, params, signal, undefined, ctx);
 	const job = (params: any) => tools.get("bash_job").execute("call-j", params, undefined, undefined, ctx);
@@ -41,7 +47,7 @@ function harness(options: { mode?: string; flags?: Record<string, unknown> } = {
 	};
 	const shutdown = () => emit("session_shutdown", { reason: "quit" });
 	const setPending = (value: boolean) => (pending = value);
-	return { bash, job, steer, shutdown, emit, setPending, sent, ctx };
+	return { bash, job, steer, shutdown, emit, setPending, sent, ctx, statuses, renderers, tools };
 }
 
 const textOf = (r: any) => r.content.map((c: any) => c.text).join("\n");
@@ -215,7 +221,7 @@ test("a notice dropped from the queue (Esc) is re-sent for the next turn; a deli
 	await h.bash({ command: "echo two", run_in_background: true });
 	await sleep(400);
 	assert.equal(h.sent.length, 1, "both completions batched into one notice");
-	assert.deepEqual(h.sent[0].message.details.jobs, ["bash-1", "bash-2"]);
+	assert.deepEqual([...h.sent[0].message.details.jobs].sort(), ["bash-1", "bash-2"]); // settle order is up to the OS
 	// Esc: the queue was cleared, the notice never reached the transcript.
 	await h.emit("agent_settled", { aborted: true });
 	assert.equal(h.sent.length, 2);
@@ -240,4 +246,101 @@ test("waiting on several jobs reports each result once, without a separate notic
 	assert.match(waited, /fast-one/);
 	assert.match(waited, /slow-one/);
 	assert.equal(h.sent.length, 0);
+});
+
+test("timeout at or below the threshold disables auto-background for that call", () => {
+	assert.equal(effectiveThresholdMs(60_000, undefined), 60_000);
+	assert.equal(effectiveThresholdMs(60_000, 120), 60_000);
+	assert.equal(effectiveThresholdMs(60_000, 60), undefined);
+	assert.equal(effectiveThresholdMs(60_000, 5), undefined);
+	assert.equal(effectiveThresholdMs(0, undefined), undefined);
+});
+
+test("a command that times out before the threshold fails in the foreground instead of moving", async () => {
+	const h = harness({ flags: { "bash-yield-threshold": "1" } });
+	await assert.rejects(h.bash({ command: "sleep 36.06", timeout: 1 }), /timed out/);
+	assert.equal(h.sent.length, 0);
+	await sleep(100);
+	assert.equal(alive("sleep 36.06"), false);
+});
+
+test("backgrounded results carry display details; notices carry per-job summaries", async () => {
+	const h = harness();
+	const call = h.bash({ command: "echo partial-line; sleep 0.6; echo finished" });
+	await sleep(200);
+	await h.steer();
+	const result = await call;
+	assert.match(textOf(result), /^Backgrounded early .* as job bash-1\./, "model-facing text unchanged");
+	assert.equal(result.details.backgrounded.jobId, "bash-1");
+	assert.equal(result.details.backgrounded.reason, "steer");
+	assert.match(result.details.backgrounded.output, /partial-line/);
+	await sleep(900);
+	const details = h.sent[0].message.details;
+	assert.deepEqual(details.jobs, ["bash-1"]);
+	assert.equal(details.summary[0].status, "succeeded");
+	assert.match(details.summary[0].line, /^bash-1 succeeded exit=0 /);
+	assert.match(details.summary[0].output, /finished/);
+});
+
+test("footer status shows running jobs in tui and clears when none remain", async () => {
+	const h = harness();
+	await h.bash({ command: "sleep 0.3", run_in_background: true });
+	assert.equal(h.statuses.at(-1), "⏵ bash-1 running");
+	await h.bash({ command: "sleep 0.3", run_in_background: true });
+	assert.equal(h.statuses.at(-1), "⏵ 2 bash jobs running");
+	await sleep(600);
+	assert.equal(h.statuses.at(-1), undefined);
+	await h.shutdown();
+});
+
+test("rpc mode never touches the footer status", async () => {
+	const h = harness({ mode: "rpc" });
+	const call = h.bash({ command: "sleep 0.3" });
+	await sleep(100);
+	await h.steer();
+	await call;
+	await sleep(400);
+	assert.deepEqual(h.statuses, []);
+});
+
+const fakeTheme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+const renderText = (component: any) => component.render(120).join("\n");
+
+test("renderResult marks backgrounded results and delegates everything else to built-in", () => {
+	const h = harness();
+	const seen: any[] = [];
+	const builtin = (result: any) => (seen.push(result), new Text(result.content[0].text, 0, 0));
+	const render = backgroundAwareRenderResult(builtin);
+	const plain: any = { content: [{ type: "text", text: "hello" }], details: undefined };
+	render(plain, { expanded: false, isPartial: false }, fakeTheme, {} as any);
+	assert.equal(seen[0], plain);
+	const out = renderText(
+		render(
+			{ content: [{ type: "text", text: "model text" }], details: { backgrounded: { jobId: "bash-3", reason: "steer", thresholdMs: 0, output: "tick 1" } } },
+			{ expanded: false, isPartial: false },
+			fakeTheme,
+			{} as any,
+		),
+	);
+	assert.match(out, /tick 1/);
+	assert.match(out, /↪ moved to background \(message received\) as bash-3/);
+	assert.doesNotMatch(out, /model text/);
+	assert.ok(h.tools.get("bash").renderResult, "bash registers the wrapper");
+});
+
+test("notice renderer: one line per job collapsed, output when expanded, default for old notices", () => {
+	const message: any = {
+		customType: "bash-yield",
+		content: "x",
+		details: {
+			jobs: ["bash-1", "bash-2"],
+			summary: [
+				{ id: "bash-1", status: "succeeded", line: "bash-1 succeeded exit=0 50s — make", output: "built ok" },
+				{ id: "bash-2", status: "failed", line: "bash-2 failed exit=1 3s — test", output: "boom" },
+			],
+		},
+	};
+	const expanded = renderText(noticeRenderer(message, { expanded: true, outputPad: 1 }, fakeTheme));
+	assert.match(expanded, /✓ bash-1 succeeded[\s\S]*built ok[\s\S]*✗ bash-2 failed[\s\S]*boom/);
+	assert.equal(noticeRenderer({ ...message, details: { jobs: ["bash-1"] } }, { expanded: false, outputPad: 1 }, fakeTheme), undefined);
 });

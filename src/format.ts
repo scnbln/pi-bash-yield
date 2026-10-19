@@ -37,6 +37,23 @@ export function backgroundedText(job: Job, reason: "steer" | "threshold" | "requ
 	return lines.join("\n");
 }
 
+/** One-line TUI marker for a call that moved to the background. Display only; the model gets `backgroundedText`. */
+export function backgroundMarker(jobId: string, reason: "steer" | "threshold" | "requested", thresholdMs: number): string {
+	const why = {
+		steer: "moved to background (message received)",
+		threshold: `moved to background (still running after ${seconds(thresholdMs)})`,
+		requested: "started in background",
+	}[reason];
+	return `↪ ${why} as ${jobId} · keeps running, reports when done`;
+}
+
+/** Footer status while jobs run, or undefined to clear it. */
+export function runningStatus(running: Job[]): string | undefined {
+	if (running.length === 0) return undefined;
+	if (running.length === 1) return `⏵ ${running[0].id} running`;
+	return `⏵ ${running.length} bash jobs running`;
+}
+
 export function notificationText(jobs: Job[], now = Date.now()): string {
 	const header = jobs.length === 1 ? "Background bash job finished:" : `${jobs.length} background bash jobs finished:`;
 	const blocks = jobs.map((job) => `## ${jobLine(job, now)}\n${tail(job.text ?? "") || "(no output)"}`);
