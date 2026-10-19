@@ -6,9 +6,10 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { backgroundedText, jobLine, notificationText, tail } from "./format.ts";
+import { backgroundedText, jobLine, notificationText, runningStatus, tail } from "./format.ts";
 import { type Job, JobRegistry, NotificationBatcher, resultText } from "./jobs.ts";
 import { Interrupts, raceForeground } from "./race.ts";
+import { type BackgroundedDetails, backgroundAwareRenderResult, type NoticeDetails, noticeRenderer } from "./render.ts";
 
 export const DEFAULT_THRESHOLD_SECONDS = 60;
 const WAIT_DEFAULT_SECONDS = 300;
@@ -17,6 +18,7 @@ const WAIT_MAX_SECONDS = 1800;
 const STEER_QUEUE_GRACE_MS = 500;
 const MAX_TIMER_MS = 2_147_483_647;
 const NOTICE_TYPE = "bash-yield";
+const STATUS_KEY = "bash-yield";
 
 export interface Capabilities {
 	/** A user steer moves the running foreground command to the background. */
@@ -44,6 +46,16 @@ export function parseThresholdSeconds(raw: unknown): number {
 	return value * 1000 > MAX_TIMER_MS ? 0 : value;
 }
 
+/**
+ * Auto-background threshold for one call, or undefined when it must not fire: a command whose
+ * own timeout ends it at or before the threshold would be killed right after moving.
+ */
+export function effectiveThresholdMs(thresholdMs: number, timeoutSeconds: unknown): number | undefined {
+	if (thresholdMs <= 0) return undefined;
+	if (typeof timeoutSeconds === "number" && timeoutSeconds > 0 && timeoutSeconds * 1000 <= thresholdMs) return undefined;
+	return thresholdMs;
+}
+
 const bashJobSchema = Type.Object({
 	action: StringEnum(["status", "output", "wait", "kill"] as const, {
 		description: "status: list jobs (or one job). output: current/final output. wait: block until the job(s) finish. kill: terminate.",
@@ -54,6 +66,13 @@ const bashJobSchema = Type.Object({
 
 function text(value: string): AgentToolResult<undefined> {
 	return { content: [{ type: "text", text: value }], details: undefined };
+}
+
+function backgrounded(job: Job, reason: BackgroundedDetails["backgrounded"]["reason"], thresholdMs: number, partial: string): AgentToolResult<BackgroundedDetails> {
+	return {
+		content: [{ type: "text", text: backgroundedText(job, reason, thresholdMs, partial) }],
+		details: { backgrounded: { jobId: job.id, reason, thresholdMs, output: tail(partial, 2000) } },
+	};
 }
 
 export default function bashYield(pi: ExtensionAPI) {
@@ -71,11 +90,29 @@ export default function bashYield(pi: ExtensionAPI) {
 
 	let disposed = false;
 	const steer = new Interrupts();
+	// Latest TUI context, for the footer status; job settlement happens outside any handler.
+	let statusCtx: ExtensionContext | undefined;
+	const trackStatusCtx = (ctx: ExtensionContext) => {
+		if (ctx.mode === "tui") statusCtx = ctx;
+	};
+	const refreshStatus = () => {
+		if (!statusCtx) return;
+		try {
+			statusCtx.ui.setStatus(STATUS_KEY, disposed ? undefined : runningStatus(registry.running()));
+		} catch {
+			statusCtx = undefined; // stale after reload or session switch
+		}
+	};
 	const notify = (jobs: Job[], deliverAs: "steer" | "nextTurn") => {
 		if (disposed) return;
+		const now = Date.now();
+		const details: NoticeDetails = {
+			jobs: jobs.map((j) => j.id),
+			summary: jobs.map((j) => ({ id: j.id, status: j.status, line: jobLine(j, now), output: tail(j.text ?? "") })),
+		};
 		try {
 			pi.sendMessage(
-				{ customType: NOTICE_TYPE, content: notificationText(jobs), display: true, details: { jobs: jobs.map((j) => j.id) } },
+				{ customType: NOTICE_TYPE, content: notificationText(jobs, now), display: true, details },
 				{ deliverAs, triggerTurn: deliverAs === "steer" },
 			);
 		} catch {
@@ -83,7 +120,14 @@ export default function bashYield(pi: ExtensionAPI) {
 		}
 	};
 	const batcher = new NotificationBatcher((jobs) => notify(jobs, "steer"));
-	const registry = new JobRegistry({ onSettled: (job) => batcher.add(job) });
+	const registry = new JobRegistry({
+		onSettled: (job) => {
+			refreshStatus();
+			batcher.add(job);
+		},
+	});
+	pi.registerMessageRenderer(NOTICE_TYPE, noticeRenderer);
+	pi.on("session_start", (_event, ctx) => trackStatusCtx(ctx));
 
 	// A notice counts as delivered once it is in the transcript.
 	pi.on("message_end", (event) => {
@@ -137,6 +181,8 @@ export default function bashYield(pi: ExtensionAPI) {
 		batcher.dispose();
 		registry.killAll();
 		steer.fire();
+		refreshStatus();
+		statusCtx = undefined;
 	});
 
 	const builtin = createBashToolDefinition(process.cwd());
@@ -149,7 +195,9 @@ export default function bashYield(pi: ExtensionAPI) {
 				Type.Boolean({ description: "Start as a background job and return immediately. Use for long-running servers or watchers." }),
 			),
 		}),
+		renderResult: builtin.renderResult && backgroundAwareRenderResult(builtin.renderResult),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			trackStatusCtx(ctx);
 			const { run_in_background, ...bashParams } = params;
 			const settings = pi.getSettings();
 			const base = createBashToolDefinition(ctx.cwd, { commandPrefix: settings.shellCommandPrefix, shellPath: settings.shellPath });
@@ -181,19 +229,20 @@ export default function bashYield(pi: ExtensionAPI) {
 			const detach = (): Job => {
 				detached = true;
 				signal?.removeEventListener("abort", forwardAbort);
-				return registry.adopt(params.command, run, controller, () => latest, startedAt);
+				const job = registry.adopt(params.command, run, controller, () => latest, startedAt);
+				refreshStatus();
+				return job;
 			};
 
 			if (run_in_background && caps.background && !signal?.aborted) {
-				const job = detach();
-				return text(backgroundedText(job, "requested", 0, ""));
+				return backgrounded(detach(), "requested", 0, "");
 			}
 
 			const interrupt = caps.yieldOnSteer ? steer.register() : undefined;
 			try {
 				const outcome = await raceForeground(run, {
 					interrupt: interrupt?.promise ?? new Promise<void>(() => {}),
-					thresholdMs: caps.background ? thresholdMs() : undefined,
+					thresholdMs: caps.background ? effectiveThresholdMs(thresholdMs(), bashParams.timeout) : undefined,
 				});
 				if (outcome.kind === "settled") return outcome.value;
 				// Already aborted (Esc) or shutting down: let the built-in report the kill as usual.
@@ -201,8 +250,7 @@ export default function bashYield(pi: ExtensionAPI) {
 					controller.abort();
 					return await run;
 				}
-				const job = detach();
-				return text(backgroundedText(job, outcome.reason, thresholdMs(), latest));
+				return backgrounded(detach(), outcome.reason, thresholdMs(), latest);
 			} finally {
 				interrupt?.dispose();
 				if (!detached) signal?.removeEventListener("abort", forwardAbort);

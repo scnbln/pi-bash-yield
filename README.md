@@ -15,12 +15,14 @@ pi install npm:pi-bash-yield
 | Trigger | What happens |
 |---|---|
 | You press Enter (steer) while `bash` runs | The command moves to the background as `bash-N`; your message is delivered next. |
-| The command runs longer than the threshold (default 60 s) | Same, without any input. |
+| The command runs longer than the threshold (default 60 s) | Same, without any input. Skipped when the call's own `timeout` ends it at or before the threshold. |
 | The model passes `run_in_background: true` | The command starts as a background job immediately. |
 | You press Esc | The command is killed, exactly as with the built-in tool. |
 | Alt+Enter (follow-up) | No yield; the follow-up waits for the agent as usual. |
 
 When background jobs finish, their results are sent to the model as one batched message. The message is delivered before the next LLM call if the agent is busy, or starts a new turn if it is idle.
+
+In the TUI, a backgrounded call ends with a `↪ moved to background as bash-N` line, the footer shows `⏵ bash-N running` (or a count) while jobs run, and each finished job takes one line (`✓ bash-N exit=0 12s — …`) until you expand tool output. This changes only the display; the model receives the same text.
 
 The model also gets a `bash_job` tool with four actions: `status`, `output`, `wait`, and `kill`. `wait` stops early as soon as you send a message.
 
@@ -62,7 +64,7 @@ pi -e ./src/index.ts # try it locally
 The e2e tests (`test/e2e`) use a scripted faux model (`test/e2e/faux-provider.ts`), so they need no API key:
 
 - `pi.test.mjs` drives `pi --mode rpc` and `pi -p`. It covers steering with an image, completion notices, `new_session` cleanup, and headless runs.
-- `tui.test.mjs` drives the interactive TUI through tmux and is skipped when tmux is missing. It covers steering with Enter, Esc kill, the threshold, and `/reload` cleanup.
+- `tui.test.mjs` drives the interactive TUI through tmux and is skipped when tmux is missing. It covers steering with Enter (including the background marker, footer status, and collapsed notice), Esc kill, the threshold, and `/reload` cleanup.
 
 ### Manual check
 
